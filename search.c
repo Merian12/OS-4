@@ -242,8 +242,13 @@ int main(int argc, char ** argv) {
   
     for (i = 0; i < tasks; i++) {
       Interval * chunk = malloc(sizeof(Interval));
-      chunk->from = i * (text_length / tasks);                         // TODO: find proper limits
-      chunk->to = chunk->from + (text_length / tasks);
+		int chunkSize = text_length / tasks;
+      chunk->from = i * chunkSize;                     // TODO: find proper limits
+		if ( i == tasks - 1) {
+		chunk->to = text_length; // To avoid going outside text
+		} else {
+		chunk->to = (i + 1) * chunkSize + (pattern_length - 1);
+		}
       taskp[i] = task_create(chunk, search);
       pool_submit(taskp[i]);
     }
