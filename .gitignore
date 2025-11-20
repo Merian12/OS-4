@@ -1,0 +1,5 @@
+/mylib/
+*.o
+/demo
+/search
+/.idea/
