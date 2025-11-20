@@ -1,15 +1,15 @@
 /**
- * @file   aq.tsafe
+ * @file   aq.c
  * @Author 02335 team
  * @date   October, 2024
- * @brief  Thread-safe Alarm Queue implementation
+ * @brief  Alarm queue implementation - FIXED v3
  */
 
 #include "aq.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
 
-/* ---------------- NODE STRUCT ---------------- */
 
 typedef struct queueNode {
     void *msg;
@@ -17,161 +17,147 @@ typedef struct queueNode {
     struct queueNode *next;
 } queueNode;
 
-/* ---------------- QUEUE STRUCT ---------------- */
-
-typedef struct AQ {
+typedef struct Queue {
     queueNode *head;
+    int alarmEnqueued;
     pthread_mutex_t lock;
-    pthread_cond_t notEmpty;
-    pthread_cond_t alarmFree;
-} AQ;
+    pthread_cond_t alarm_received;
+    pthread_cond_t message_sent;
+} Queue;
 
-/* ---------------- HELPERS ---------------- */
-
-static queueNode *createNode(void *msg, MsgKind k) {
-    queueNode *n = malloc(sizeof(queueNode));
-    n->msg = msg;
-    n->msgKind = k;
-    n->next = NULL;
-    return n;
+queueNode *createQueueNode(void *msg, MsgKind k) {
+    queueNode *newQueueNode = malloc(sizeof(queueNode));
+    newQueueNode->msg = msg;
+    newQueueNode->msgKind = k;
+    newQueueNode->next = NULL;
+    return newQueueNode;
 }
 
-static int deleteNode(queueNode **head, queueNode *target, void **msgOut) {
-    queueNode **pp = head;
-    queueNode *cur = *head;
-
-    while (cur != NULL) {
-        if (cur == target) {
-            *pp = cur->next;
-            *msgOut = cur->msg;
-            int kind = cur->msgKind;
-            free(cur);
-            return kind;
-        }
-        pp = &cur->next;
-        cur = cur->next;
+void insertAtEnd(queueNode **head, void *msg, MsgKind k) {
+    queueNode *newQueueNode = createQueueNode(msg, k);
+    if (*head == NULL) {
+        *head = newQueueNode;
+        return;
     }
-    return AQ_NO_MSG;
+    queueNode *temp = *head;
+    while (temp->next != NULL) {
+        temp = temp->next;
+    }
+    temp->next = newQueueNode;
 }
 
-
+int deleteNode(queueNode **head, int msgContent, void **msg) {
+    queueNode **tempP = head;
+    queueNode *temp = *head;
+    while (temp != NULL) {
+        if (*(int *) temp->msg == msgContent) {
+            MsgKind retval = temp->msgKind;
+            *msg = temp->msg;
+            *tempP = temp->next;
+            free(temp);
+            return retval;
+        }
+        tempP = &temp->next;
+        temp = temp->next;
+    }
+    return -1;
+}
 
 AlarmQueue aq_create() {
-    AQ *q = malloc(sizeof(AQ));
-    if (!q) return NULL;
-
-    q->head = NULL;
-    pthread_mutex_init(&q->lock, NULL);
-    pthread_cond_init(&q->notEmpty, NULL);
-    pthread_cond_init(&q->alarmFree, NULL);
-
-    return (AlarmQueue) q;
+    Queue *aq = malloc(sizeof(Queue));
+    if (aq != NULL) {
+        aq->head = NULL;
+        aq->alarmEnqueued = 0;
+        pthread_mutex_init(&(aq->lock), NULL);
+        pthread_cond_init(&(aq->alarm_received), NULL);
+        pthread_cond_init(&(aq->message_sent), NULL);
+        return aq;
+    }
+    return NULL;
 }
 
-/* ---------------- SEND ---------------- */
-
 int aq_send(AlarmQueue aq, void *msg, MsgKind k) {
-    if (!aq) return AQ_UNINIT;
-    if (!msg) return AQ_NULL_MSG;
+    if (msg == NULL) return AQ_NULL_MSG;
+    if (aq == NULL) return AQ_UNINIT;
 
-    AQ *q = (AQ*) aq;
+    Queue *queue = aq;
 
-    pthread_mutex_lock(&q->lock);
+    pthread_mutex_lock(&queue->lock);
 
-    /* If sending an alarm: wait until NO alarm exists */
+    // If sending an alarm, wait until no alarm exists in queue
     if (k == AQ_ALARM) {
-        int alarmExists = 1;
-        while (alarmExists) {
-            alarmExists = 0;
-            for (queueNode *t = q->head; t; t = t->next) {
-                if (t->msgKind == AQ_ALARM) {
-                    alarmExists = 1;
-                    break;
-                }
-            }
-            if (alarmExists)
-                pthread_cond_wait(&q->alarmFree, &q->lock);
+        while (queue->alarmEnqueued) {
+            pthread_cond_wait(&queue->alarm_received, &queue->lock);
         }
+        queue->alarmEnqueued = 1;  // Mark alarm as enqueued
     }
 
-    /* Insert new message */
-    int wasEmpty = (q->head == NULL);
+    insertAtEnd(&queue->head, msg, k);
 
-    queueNode *n = createNode(msg, k);
-    if (q->head == NULL) {
-        q->head = n;
-    } else {
-        queueNode *t = q->head;
-        while (t->next) t = t->next;
-        t->next = n;
-    }
+    // Signal that a message is available
+    pthread_cond_signal(&queue->message_sent);
 
-    if (wasEmpty)
-        pthread_cond_signal(&q->notEmpty);
-
-    pthread_mutex_unlock(&q->lock);
+    pthread_mutex_unlock(&queue->lock);
     return 0;
 }
 
-/* ---------------- RECEIVE ---------------- */
+int aq_recv(AlarmQueue aq, void **msg) {
+    if (msg == NULL) return AQ_NULL_MSG;
+    if (aq == NULL) return AQ_UNINIT;
 
-int aq_recv(AlarmQueue aq, void **msgOut) {
-    if (!msgOut) return AQ_NULL_MSG;
-    if (!aq) return AQ_UNINIT;
+    Queue *queue = aq;
 
-    AQ *q = (AQ*) aq;
-    pthread_mutex_lock(&q->lock);
+    pthread_mutex_lock(&queue->lock);
 
-    while (q->head == NULL)
-        pthread_cond_wait(&q->notEmpty, &q->lock);
-
-    /* Priority: alarms first */
-    for (queueNode *t = q->head; t; t = t->next) {
-        if (t->msgKind == AQ_ALARM) {
-            int kind = deleteNode(&q->head, t, msgOut);
-            pthread_cond_signal(&q->alarmFree);
-            pthread_mutex_unlock(&q->lock);
-            return kind;
-        }
+    // Wait until at least one message is available
+    while (queue->head == NULL) {
+        pthread_cond_wait(&queue->message_sent, &queue->lock);
     }
 
-    /* Otherwise: remove head */
-    queueNode *first = q->head;
-    int kind = deleteNode(&q->head, first, msgOut);
+    queueNode *temp = queue->head;
 
-    pthread_mutex_unlock(&q->lock);
+    // Check if queue has alarm msg
+    if (queue->alarmEnqueued) {
+
+        int kind = deleteNode(&queue->head, *(int *) temp-> msg, msg);
+
+        // Clear alarm flag and signal that alarm slot is now free
+        queue->alarmEnqueued = 0;
+
+        pthread_cond_signal(&queue->alarm_received);
+        pthread_mutex_unlock(&queue->lock);
+        return kind;
+    }
+
+    // No alarm message found, get first normal message
+    temp = queue->head;
+    int kind = deleteNode(&queue->head, *(int *) temp->msg, msg);
+
+    pthread_mutex_unlock(&queue->lock);
     return kind;
 }
 
-/* ---------------- SIZE ---------------- */
-
+// Not sure we need locks on size functions
+// letting them be for now just in case.
 int aq_size(AlarmQueue aq) {
-    if (!aq) return AQ_UNINIT;
+    int size = 0;
+    Queue *queue = aq;
+    pthread_mutex_lock(&queue->lock);
 
-    AQ *q = (AQ*) aq;
-    pthread_mutex_lock(&q->lock);
+    queueNode *temp = queue->head;
 
-    int count = 0;
-    for (queueNode *t = q->head; t; t = t->next)
-        count++;
-
-    pthread_mutex_unlock(&q->lock);
-    return count;
+    while (temp != NULL) {
+        size++;
+        temp = temp->next;
+    }
+    pthread_mutex_unlock(&queue->lock);
+    return size;
 }
 
-/* ---------------- ALARM COUNT ---------------- */
-
 int aq_alarms(AlarmQueue aq) {
-    if (!aq) return AQ_UNINIT;
-
-    AQ *q = (AQ*) aq;
-    pthread_mutex_lock(&q->lock);
-
-    int count = 0;
-    for (queueNode *t = q->head; t; t = t->next)
-        if (t->msgKind == AQ_ALARM)
-            count++;
-
-    pthread_mutex_unlock(&q->lock);
+    Queue *queue = aq;
+    pthread_mutex_lock(&queue->lock);
+    int count = queue->alarmEnqueued;
+    pthread_mutex_unlock(&queue->lock);
     return count;
 }
