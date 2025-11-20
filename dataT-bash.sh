@@ -2,5 +2,5 @@
 
 for i in $(seq 1 20);
 do
-    ./search shakespeare-full.txt "Something is rotten in the state of Denmark." 8 $i dataT.csv
+    ./search shakespeare-full.txt "Something is rotten in the state of Denmark." $i $i dataT.csv
 done
